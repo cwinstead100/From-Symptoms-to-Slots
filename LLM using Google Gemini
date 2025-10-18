@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+"""
+Dermatology Triage LLM
+----------------------
+Uses Google Gemini to analyze free-text dermatology patient descriptions
+and assign triage priority ratings (urgent / priority_soon / routine).
+Includes condition cues, red flags, location heuristics, and structured JSON output.
+
+Usage:
+  export GOOGLE_API_KEY="YOUR_KEY"
+  python derm_triage_llm.py input.csv output_scored.csv
+"""
+
+import os, sys, json, csv, time, random
+from typing import List, Dict, Any, Optional
+import google.generativeai as genai
+
+# ==========================
+# 1. CONFIGURATION
+# ==========================
+genai.configure(api_key=os.environ.get("GOOGLE_API_KEY", ""))
+MODEL_NAME = "gemini-1.5-pro"   # or "gemini-1.5-flash"
+TEMPERATURE = 0.2
+
+# ==========================
+# 2. CORPUS / TERMINOLOGY
+# ==========================
+DERM_CONDITIONS = [
+    "acne","atopic_dermatitis","psoriasis","rosacea","tinea_corporis",
+    "tinea_pedis","onychomycosis","impetigo","folliculitis","contact_dermatitis",
+    "urticaria","scabies","shingles","cellulitis","molluscum","warts",
+    "vitiligo","cold_sore","actinic_keratosis","basal_cell_carcinoma",
+    "squamous_cell_carcinoma","melanoma"
+]
+CANCER_LIKE = {"basal_cell_carcinoma","squamous_cell_carcinoma","melanoma"}
+
+CONDITION_CUES: Dict[str,List[str]] = {
+    "acne":["whiteheads","blackheads","pimples","cystic bumps"],
+    "atopic_dermatitis":["itchy patches","behind knees","elbow creases","worse with soaps"],
+    "psoriasis":["thick scaly plaques","elbows","knees","silvery scale"],
+    "rosacea":["facial flushing","visible blood vessels","triggered by heat","triggered by wine"],
+    "tinea_corporis":["ring-shaped","central clearing","itchy rash"],
+    "tinea_pedis":["athlete's foot","between toes","peeling"],
+    "onychomycosis":["yellow thick toenail","crumbly nail"],
+    "impetigo":["honey-colored crust","around nose and mouth"],
+    "folliculitis":["pimple-like bumps around hairs","after shaving"],
+    "contact_dermatitis":["after new soap","after nickel jewelry","after poison ivy"],
+    "urticaria":["hives","welts","move around"],
+    "scabies":["worse at night","burrows","between fingers"],
+    "shingles":["band of blisters","one-sided","burning pain"],
+    "cellulitis":["warm red area","spreading","fever"],
+    "molluscum":["small pearly bumps","center dimple"],
+    "warts":["rough bumps","on fingers or feet"],
+    "vitiligo":["white patches","loss of pigment"],
+    "cold_sore":["tingling lip blister","recurrent"],
+    "actinic_keratosis":["scaly rough spot","sun exposed","precancer"],
+    "basal_cell_carcinoma":["pearly bump","bleeds easily","non-healing"],
+    "squamous_cell_carcinoma":["scaly sore","thick crust","sun exposed"],
+    "melanoma":["asymmetry","irregular border","color variegation","new dark mole"]
+}
+
+BODY_SITES = [
+    "face","forehead","cheeks","nose","chin","neck","scalp","upper back","lower back",
+    "chest","abdomen","shoulders","upper arm","forearm","wrist","hand","fingers",
+    "thigh","calf","ankle","foot","toes","groin","buttock","armpit","near the eye"
+]
+
+RED_FLAG_HINTS = {
+    "fever_reported":["fever","chills","feverish"],
+    "non_healing":["won't heal","non-healing","keeps coming back","not healing"],
+    "asymmetry":["asymmetry","asymmetric"],
+    "irregular_border":["irregular border","uneven edge","ragged edge"],
+    "color_variegation":["multiple colors","color variegation","two colors","dark and light"],
+    "evolving":["growing","changing","evolving"],
+    "bleeding":["bleeding","bleeds"],
+}
+
+# ==========================
+# 3. TRIAGE PROMPT
+# ==========================
+def triage_policy_markdown() -> str:
+    return f"""
+You are a dermatology intake assistant. Classify patient-described skin symptoms into a triage priority.
+Return STRICT JSON only (no prose) following this schema:
+
+{{
+  "score": 0-10,
+  "label": "urgent" | "priority_soon" | "routine",
+  "matched_terms": [string],
+  "red_flags": [string],
+  "suspected_conditions": [string],
+  "rationale": string
+}}
+
+Rules:
+- Severity mentioned 0–10 maps to 0–5 base points (sev//2).
+- Red flags add: fever_reported(+3), non_healing(+3),
+  asymmetry(+2), irregular_border(+2), color_variegation(+2), evolving(+2), bleeding(+2).
+- Cancer-like ({sorted(CANCER_LIKE)}) adds +2.
+- Sensitive sites (face, near the eye, groin, armpit, scalp) add +1.
+- Rapid onset <=3 days with severity >=7 adds +1.
+
+Labels:
+- score >= 8  => "urgent"
+- 5–7         => "priority_soon"
+- <= 4        => "routine"
+
+If unsure or no match, include "other" in suspected_conditions.
+Infer severity if implied by language. Never provide medical advice.
+"""
+
+SYSTEM_INSTRUCTION = f"""
+You have a dermatology terminology reference:
+- Conditions: {', '.join(DERM_CONDITIONS)}
+- Body sites: {', '.join(BODY_SITES)}
+- Condition cues: {json.dumps(CONDITION_CUES)}
+- Red flag hints: {json.dumps(RED_FLAG_HINTS)}
+""" + triage_policy_markdown()
+
+# ==========================
+# 4. MODEL CREATION
+# ==========================
+def make_model():
+    return genai.GenerativeModel(
+        model_name=MODEL_NAME,
+        system_instruction=SYSTEM_INSTRUCTION
+    )
+
+# ==========================
+# 5. TRIAGE FUNCTION
+# ==========================
+def rate_priority(transcript: str, fallback_label: str = "routine") -> Dict[str, Any]:
+    model = make_model()
+    gen_config = genai.types.GenerationConfig(
+        temperature=TEMPERATURE,
+        max_output_tokens=512,
+        response_mime_type="application/json",
+    )
+    prompt = f"Patient transcript:\n{transcript}\n\nReturn JSON only."
+    last_err = None
+
+    for attempt in range(3):
+        try:
+            resp = model.generate_content(prompt, generation_config=gen_config)
+            txt = resp.text.strip()
+            if txt.startswith("```"):
+                txt = txt.strip("`")
+                txt = txt[txt.find("{"):txt.rfind("}")+1]
+            data = json.loads(txt)
+            data.setdefault("label", fallback_label)
+            data.setdefault("score", 0)
+            data.setdefault("matched_terms", [])
+            data.setdefault("red_flags", [])
+            data.setdefault("suspected_conditions", [])
+            data.setdefault("rationale", "")
+            data["score"] = int(max(0, min(10, int(data["score"]))))
+            if data["label"] not in {"urgent","priority_soon","routine"}:
+                data["label"] = fallback_label
+            return data
+        except Exception as e:
+            time.sleep(0.8*(attempt+1))
+            last_err = e
+
+    return {
+        "score": 0,
+        "label": fallback_label,
+        "matched_terms": [],
+        "red_flags": [],
+        "suspected_conditions": [],
+        "rationale": f"Fallback due to parsing error: {last_err}"
+    }
+
+# ==========================
+# 6. CSV ANNOTATION
+# ==========================
+def annotate_csv(in_path: str, out_path: str, limit: Optional[int] = None, seed: int = 7):
+    random.seed(seed)
+    rows = []
+    with open(in_path, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for i, row in enumerate(reader, 1):
+            if limit and i > limit: break
+            tri = rate_priority(row.get("transcript","").strip())
+            row["llm_triage_score_0_10"] = tri["score"]
+            row["llm_triage_label"] = tri["label"]
+            row["llm_triage_red_flags"] = ";".join(tri["red_flags"])
+            row["llm_triage_suspected_conditions"] = ";".join(tri["suspected_conditions"])
+            row["llm_triage_rationale"] = tri["rationale"]
+            rows.append(row)
+
+    if not rows:
+        print("No rows processed.")
+        return
+
+    fieldnames = list(rows[0].keys())
+    with open(out_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for r in rows:
+            writer.writerow(r)
+
+# ==========================
+# 7. MAIN ENTRY
+# ==========================
+if __name__ == "__main__":
+    if len(sys.argv) >= 3:
+        annotate_csv(sys.argv[1], sys.argv[2])
+    else:
+        demo = "I noticed a pea-sized dark brown spot on my cheek last month. It’s started bleeding a bit and looks more irregular. Pretty worried."
+        print(json.dumps(rate_priority(demo), indent=2))
