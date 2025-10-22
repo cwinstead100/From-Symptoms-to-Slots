@@ -1,0 +1,253 @@
+# evaluate_triage_from_text.py
+# Checks how well the free-text descriptions map to severity/triage labels.
+# It predicts a triage label from the transcript alone and compares to the CSV's triage_label.
+
+import csv
+import argparse
+import re
+from collections import Counter, defaultdict
+from typing import Tuple, List, Dict
+
+SENSITIVE_SITES = {"face", "near the eye", "groin", "armpit", "scalp"}
+DURATIONS = [
+    "today", "yesterday", "two days", "three days", "about a week", "ten days",
+    "two weeks", "about a month", "six weeks", "two months", "three months",
+    "about a year", "several years"
+]
+DURATION_DAYS = {
+    "today": 0, "yesterday": 1, "two days": 2, "three days": 3,
+    "about a week": 7, "ten days": 10, "two weeks": 14, "about a month": 30,
+    "six weeks": 42, "two months": 60, "three months": 90,
+    "about a year": 365, "several years": 365 * 3
+}
+BODY_SITES = [
+    "face", "forehead", "cheeks", "nose", "chin", "neck", "scalp", "upper back", "lower back",
+    "chest", "abdomen", "shoulders", "upper arm", "forearm", "wrist", "hand", "fingers",
+    "thigh", "calf", "ankle", "foot", "toes", "groin", "buttock", "armpit", "near the eye"
+]
+
+# Red-flag phrases we can extract from text (subset mirrors your generator signals)
+RF_PATTERNS = {
+    "fever_reported": r"\bfever\b",
+    "non_healing": r"\bnon[- ]healing\b|\bhasn'?t really changed\b|\bwon'?t heal\b",
+    "asymmetry": r"\basymmetr",
+    "irregular_border": r"\birregular border",
+    "color_variegation": r"\bcolor varieg",
+    "evolving": r"\bevolving\b|\bgetting (?:worse|bigger)\b|\bchanged\b",
+    "bleeding": r"\bbleeding\b|bleeds easily",
+}
+
+# Extra symptom intensity cues to slightly bump score
+INTENSITY_BUMPS = [
+    (r"\bburning\b|\bstinging\b|\btender\b|\bsore\b", 1),
+    (r"\bsuper itchy\b|\bmaddening itch\b", 1),
+    (r"\bband of blisters\b", 1),  # shingles-like phrasing
+    (r"\bworse (?:at night|with)\b", 1),
+]
+
+# Cancer-suspicious surface cues (from your transcript builders)
+CANCER_LIKE_CUES = [
+    r"\bpearly\b", r"\bwaxy\b", r"\bnon[- ]healing\b", r"\basymmetry\b",
+    r"\birregular border\b", r"\bcolor varieg", r"\bnew dark mole\b"
+]
+
+def find_first_in_list(text: str, options: List[str]) -> str:
+    for opt in options:
+        if opt in text:
+            return opt
+    return ""
+
+def duration_to_days_from_text(text: str) -> int:
+    dur = find_first_in_list(text, DURATIONS)
+    if dur:
+        return DURATION_DAYS.get(dur, 14)
+    return 14  # default
+
+def extract_site_from_text(text: str) -> str:
+    return find_first_in_list(text, BODY_SITES)
+
+def extract_red_flags(text: str) -> List[str]:
+    flags = []
+    for name, pat in RF_PATTERNS.items():
+        if re.search(pat, text):
+            flags.append(name)
+    # Heuristic: descriptors strongly tied to melanoma/SCC/BCC
+    for pat in CANCER_LIKE_CUES:
+        if re.search(pat, text):
+            # Map some cues to existing RF buckets where sensible
+            if "non_healing" not in flags and re.search(r"non[- ]healing", text):
+                flags.append("non_healing")
+            # Treat asymmetry/irregular/color varieg/evolving as their specific flags
+            # (already handled via RF_PATTERNS above if matches)
+            break
+    return sorted(set(flags))
+
+def text_based_triage_score(text: str) -> int:
+    """
+    Recreates a 0–10 style score using ONLY transcript text.
+    We do not look at severity_0_10 or red_flags columns—this simulates a reader seeing only the description.
+    """
+    score = 0
+    # Red flags from text
+    flags = extract_red_flags(text)
+    rf_weights = {
+        "fever_reported": 3,
+        "non_healing": 3,
+        "asymmetry": 2,
+        "irregular_border": 2,
+        "color_variegation": 2,
+        "evolving": 2,
+        "bleeding": 2,
+    }
+    for rf in flags:
+        score += rf_weights.get(rf, 1)
+
+    # Sensitive site bump
+    site = extract_site_from_text(text)
+    if site in SENSITIVE_SITES:
+        score += 1
+        if site == "near the eye":
+            score += 1  # a bit more sensitive
+
+    # Duration + intensity heuristics
+    days = duration_to_days_from_text(text)
+    for pat, bump in INTENSITY_BUMPS:
+        if re.search(pat, text):
+            score += bump
+
+    # "Rapid + severe" inference from text: if very short duration and intense language present
+    if days <= 3 and re.search(r"\b(burning|stinging|super itchy|maddening itch|very painful)\b", text):
+        score += 1
+
+    # Cancer-suspicious cues bump slightly
+    if any(re.search(p, text) for p in CANCER_LIKE_CUES):
+        score += 2
+
+    # Cap to [0,10]
+    score = max(0, min(10, int(round(score))))
+    return score
+
+def score_to_label(score: int) -> str:
+    if score >= 8:
+        return "urgent"
+    elif score >= 5:
+        return "priority_soon"
+    else:
+        return "routine"
+
+def sev_to_bucket(sev: int) -> str:
+    """Map numeric severity_0_10 to coarse buckets."""
+    if sev >= 8:
+        return "high"
+    elif sev >= 5:
+        return "medium"
+    else:
+        return "low"
+
+def label_to_bucket(label: str) -> str:
+    """Map triage label to severity-like buckets for agreement checks."""
+    return {"urgent": "high", "priority_soon": "medium", "routine": "low"}[label]
+
+def confusion_matrix(true_labels: List[str], pred_labels: List[str], classes: List[str]) -> Dict[str, Dict[str, int]]:
+    cm = {t: {p: 0 for p in classes} for t in classes}
+    for t, p in zip(true_labels, pred_labels):
+        cm[t][p] += 1
+    return cm
+
+def precision_recall_f1(cm: Dict[str, Dict[str, int]], classes: List[str]) -> Dict[str, Dict[str, float]]:
+    metrics = {}
+    for c in classes:
+        tp = cm[c][c]
+        fp = sum(cm[t][c] for t in classes if t != c)
+        fn = sum(cm[c][p] for p in classes if p != c)
+        prec = tp / (tp + fp) if (tp + fp) else 0.0
+        rec = tp / (tp + fn) if (tp + fn) else 0.0
+        f1 = (2 * prec * rec) / (prec + rec) if (prec + rec) else 0.0
+        metrics[c] = {"precision": prec, "recall": rec, "f1": f1}
+    return metrics
+
+def accuracy(true_labels: List[str], pred_labels: List[str]) -> float:
+    correct = sum(t == p for t, p in zip(true_labels, pred_labels))
+    return correct / len(true_labels) if true_labels else 0.0
+
+def cohen_kappa(true_labels: List[str], pred_labels: List[str], classes: List[str]) -> float:
+    # Observed agreement
+    po = accuracy(true_labels, pred_labels)
+    # Expected agreement
+    true_counts = Counter(true_labels)
+    pred_counts = Counter(pred_labels)
+    n = len(true_labels)
+    pe = sum((true_counts[c] / n) * (pred_counts[c] / n) for c in classes)
+    if pe == 1.0:
+        return 1.0
+    return (po - pe) / (1 - pe) if (1 - pe) else 0.0
+
+def main():
+    parser = argparse.ArgumentParser(description="Evaluate how transcripts map to severity/triage.")
+    parser.add_argument("--csv", required=True, help="Path to generated CSV (e.g., short_derm_transcripts_10k.csv)")
+    args = parser.parse_args()
+
+    transcripts = []
+    true_triage = []
+    true_sev_num = []
+
+    with open(args.csv, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            transcripts.append(row["transcript"].strip())
+            true_triage.append(row["triage_label"].strip())
+            true_sev_num.append(int(row["severity_0_10"]))
+
+    # Predict triage from text only
+    pred_scores = [text_based_triage_score(t.lower()) for t in transcripts]
+    pred_triage = [score_to_label(s) for s in pred_scores]
+
+    classes = ["routine", "priority_soon", "urgent"]
+    cm = confusion_matrix(true_triage, pred_triage, classes)
+    acc = accuracy(true_triage, pred_triage)
+    kappa = cohen_kappa(true_triage, pred_triage, classes)
+    prf1 = precision_recall_f1(cm, classes)
+
+    # Also compare bucket agreement between numeric severity and predicted triage
+    true_buckets_from_num = [sev_to_bucket(s) for s in true_sev_num]
+    pred_buckets_from_triage = [label_to_bucket(l) for l in pred_triage]
+    bucket_classes = ["low", "medium", "high"]
+    cm_buckets = confusion_matrix(true_buckets_from_num, pred_buckets_from_triage, bucket_classes)
+    acc_buckets = accuracy(true_buckets_from_num, pred_buckets_from_triage)
+    kappa_buckets = cohen_kappa(true_buckets_from_num, pred_buckets_from_triage, bucket_classes)
+
+    # ---- Report ----
+    print("\n=== Text→Triage Evaluation (predicted from transcript only) ===")
+    print(f"Samples: {len(transcripts)}")
+    print(f"Overall Accuracy: {acc:.3f}")
+    print(f"Cohen's Kappa:   {kappa:.3f}")
+
+    print("\nConfusion Matrix (rows = true, cols = predicted):")
+    header = " " * 18 + "".join(f"{c:>16}" for c in classes)
+    print(header)
+    for t in classes:
+        row = f"{t:>18}" + "".join(f"{cm[t][p]:>16}" for p in classes)
+        print(row)
+
+    print("\nPer-class Precision / Recall / F1:")
+    for c in classes:
+        m = prf1[c]
+        print(f"{c:>18}  precision={m['precision']:.3f}  recall={m['recall']:.3f}  f1={m['f1']:.3f}")
+
+    print("\n=== Agreement vs Numeric Severity Buckets (0–10 → low/medium/high) ===")
+    print(f"Bucket Accuracy: {acc_buckets:.3f}")
+    print(f"Bucket Kappa:    {kappa_buckets:.3f}")
+    print("\nBucket Confusion Matrix (rows = true bucket from severity_0_10, cols = predicted from triage):")
+    header_b = " " * 18 + "".join(f"{c:>12}" for c in bucket_classes)
+    print(header_b)
+    for t in bucket_classes:
+        row = f"{t:>18}" + "".join(f"{cm_buckets[t][p]:>12}" for p in bucket_classes)
+        print(row)
+
+    print("\nNotes:")
+    print("- This evaluator **does not** use your CSV's red_flags/condition/severity fields when predicting; it relies only on the transcript text.")
+    print("- The text-based scoring mirrors your generator’s thresholds (urgent≥8, priority_soon 5–7, routine≤4) with heuristic cues for flags/sites/durations.")
+    print("- Use this to spot mismatches where wording suggests higher/lower urgency than the assigned label.")
+
+if __name__ == "__main__":
+    main()
